@@ -1,8 +1,9 @@
 deepspeed --master_port=29500 dpo_llama.py \
     --data_path output/res/ \
     --output_dir output/dpo \
-    --model_name output/input/Llama-2-7b-chat-hf/xxx \
-    --train_epoch 5 \
+    --model_name meta-llama/Llama-3.2-1B-Instruct \
+    --model_path output/input/Llama-3.2-1B-Instruct/xxx \
+    --train_epoch 2 \
     --learning_rate 5e-5 \
     --train_batch_size 1 \
     --source_length 1024 \

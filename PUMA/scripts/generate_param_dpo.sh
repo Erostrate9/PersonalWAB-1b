@@ -1,6 +1,6 @@
 accelerate launch test_llama.py \
-    --model_path output/param/Llama-2-7b-chat-hf/xx \
-    --base_model meta-llama/Llama-2-7b-chat-h \
+    --model_path output/param/Llama-3.2-1B-Instruct/xx \
+    --base_model meta-llama/Llama-3.2-1B-Instruct \
     --data_path data/param_data.json \
     --bf16 \
     --test_on param \

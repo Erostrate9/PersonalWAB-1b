@@ -1,5 +1,5 @@
 from transformers import GenerationConfig
-from transformers import LlamaTokenizer, LlamaForCausalLM
+from transformers import AutoModelForCausalLM, AutoTokenizer
 import torch
 import os
 from tqdm import tqdm
@@ -10,9 +10,9 @@ import json
 def parse_args():
     parser = argparse.ArgumentParser(description="Test Llama model")
 
-    parser.add_argument('--model_path', type=str, default='output/input/Llama-2-7b-chat-hf/', help='model path')
+    parser.add_argument('--model_path', type=str, default='output/input/Llama-3.2-1B-Instruct/', help='model path')
     parser.add_argument('--device', type=str, default='cuda', help='device') 
-    parser.add_argument('--base_model', type=str, default='meta-llama/Llama-2-7b-chat-hf', help='base model')
+    parser.add_argument('--base_model', type=str, default='meta-llama/Llama-3.2-1B-Instruct', help='base model')
     parser.add_argument('--save_path', type=str, default='output/merged_model', help='path to save the merged model')
     return parser.parse_args()
 
@@ -32,8 +32,10 @@ if __name__ == '__main__':
     local_rank = int(os.environ.get("LOCAL_RANK") or 0)
 
     
-    tokenizer = LlamaTokenizer.from_pretrained(model_path)
-    model = LlamaForCausalLM.from_pretrained(
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    model = AutoModelForCausalLM.from_pretrained(
             base_model,
             #torch_dtype=torch_dtype,
             device_map=device

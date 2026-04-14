@@ -1,7 +1,7 @@
 import os
 from torch.utils.data import Dataset
 from transformers import T5ForConditionalGeneration, T5Tokenizer, T5Config
-from transformers import LlamaForCausalLM, LlamaTokenizer, LlamaConfig
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from transformers import Trainer, TrainingArguments, TrainerCallback, DataCollatorWithPadding, GenerationConfig
 from transformers import (
     BitsAndBytesConfig,
@@ -23,6 +23,8 @@ from datasets import load_dataset
 from peft import TaskType, LoraConfig, get_peft_model, PeftModel
 import argparse
 import sys
+import json
+import inspect
 from utils import LlaMaTrainerwithTemperature, LLaMaDataset
 from torch.utils.data import ConcatDataset
 from datetime import datetime
@@ -34,7 +36,7 @@ def parse_args():
     parser.add_argument('--data_path', type=str, default='data', help='param data path')
     parser.add_argument('--function_data_path', type=str, default='data/function_data.json', help='function data path')
     parser.add_argument('--output_dir', type=str, default='output', help='output directory')
-    parser.add_argument('--model_name', type=str, default='llama-2-hf', help='model name')
+    parser.add_argument('--model_name', type=str, default='meta-llama/Llama-3.2-1B-Instruct', help='model name')
     parser.add_argument('--train_epoch', type=int, default=100, help='number of training epochs')
     parser.add_argument('--learning_rate', type=float, default=1e-3, help='learning rate')
     parser.add_argument('--train_batch_size', type=int, default=128, help='training batch size')
@@ -51,9 +53,53 @@ def parse_args():
     parser.add_argument('--temperature', type=float, default=1.0, help='softmax temperature')
     parser.add_argument('--float16', action='store_true', help='use float16')
     parser.add_argument('--bf16', action='store_true', help='use bf16')
-    parser.add_argument('--train_on', type=str, default='tool', choices=['function', 'param','function_param'], help='train on function or param or both')
+    parser.add_argument('--train_on', type=str, default='function', choices=['function', 'param','function_param'], help='train on function or param or both')
+    parser.add_argument('--task_weights', type=str, default=None, help='JSON dict of task upweights, e.g. {"recommend": 2}')
     
     return parser.parse_args()
+
+
+def parse_task_weights(task_weights):
+    if not task_weights:
+        return None
+    if os.path.exists(task_weights):
+        return json.load(open(task_weights))
+    return json.loads(task_weights)
+
+
+def build_training_arguments_kwargs(train_args, output_dir_name, reporter, learning_rate, train_batch_size):
+    kwargs = {
+        "output_dir": output_dir_name,
+        "num_train_epochs": train_args.train_epoch,
+        "per_device_train_batch_size": train_batch_size,
+        "per_device_eval_batch_size": train_batch_size,
+        "dataloader_num_workers": 10,
+        "warmup_ratio": train_args.warmup_ratio,
+        "learning_rate": learning_rate,
+        "logging_dir": output_dir_name + "/logs/",
+        "report_to": reporter,
+        "save_strategy": train_args.save_strategy,
+        "save_total_limit": train_args.save_total_limit,
+        "logging_steps": train_args.logging_steps,
+        "deepspeed": train_args.deepseed_config,
+        "gradient_accumulation_steps": train_args.gradient_accumulation_steps,
+        "fp16": train_args.float16,
+        "bf16": train_args.bf16,
+        "save_only_model": True,
+    }
+    signature = inspect.signature(TrainingArguments.__init__)
+    if "evaluation_strategy" in signature.parameters:
+        kwargs["evaluation_strategy"] = train_args.eval_strategy
+    else:
+        kwargs["eval_strategy"] = train_args.eval_strategy
+    return kwargs
+
+
+def build_trainer_kwargs(tokenizer):
+    signature = inspect.signature(LlaMaTrainerwithTemperature.__init__)
+    if "tokenizer" in signature.parameters:
+        return {"tokenizer": tokenizer}
+    return {"processing_class": tokenizer}
 
 
 if __name__ == '__main__':
@@ -74,6 +120,7 @@ if __name__ == '__main__':
     output_dir = current_time+'_'+str(data_path.split('/')[-1])+'_ep'+str(train_epoch)+'_lr'+str(learning_rate)+'_bch'+str(train_batch_size)
 
     output_dir_name = train_args.output_dir + '/' + train_args.model_name.split('/')[-1] + '/' + output_dir
+    task_weights = parse_task_weights(train_args.task_weights)
     
     device_map = "auto"
     world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -82,9 +129,10 @@ if __name__ == '__main__':
     if ddp:
         device_map = {"": local_rank}
     
-    tokenizer = LlamaTokenizer.from_pretrained(model_name)
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
     tokenizer.padding_side = "right"
-    tokenizer.pad_token = tokenizer.eos_token
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
     if train_args.float16:
         torch_dtype = torch.float16
@@ -93,14 +141,11 @@ if __name__ == '__main__':
     else:
         torch_dtype = torch.float32
     
-    config = LlamaConfig.from_pretrained(model_name)
-    model = LlamaForCausalLM.from_pretrained(model_name, 
-                                             torch_dtype=torch_dtype,
-                                             config=config,
-                                            #load_in_8bit=True,
-                                            #load_in_4bit=True,
-                                            #bnb_4bit_compute_dtype=torch_dtype,
-                                             device_map=device_map)
+    config = AutoConfig.from_pretrained(model_name)
+    model = AutoModelForCausalLM.from_pretrained(model_name, 
+                                                 torch_dtype=torch_dtype,
+                                                 config=config,
+                                                 device_map=device_map)
 
     model.config.use_cache = False
 
@@ -123,49 +168,28 @@ if __name__ == '__main__':
     reporter = ['wandb'] if local_rank == 0 else "none"
 
     training_args = TrainingArguments(
-        output_dir=output_dir_name,
-
-        num_train_epochs=train_epoch,         
-        per_device_train_batch_size=train_batch_size, 
-        per_device_eval_batch_size=train_batch_size, 
-        dataloader_num_workers=10,
-
-        #optim = "adamw_8bit",   
-        warmup_ratio=train_args.warmup_ratio,
-        learning_rate=learning_rate,
-        # weight_decay=0.01,   
-                   
-        logging_dir=output_dir_name+'/logs/',
-        report_to=reporter,
-        evaluation_strategy=train_args.eval_strategy,
-        save_strategy=train_args.save_strategy,
-        save_total_limit=train_args.save_total_limit,
-
-        logging_steps=train_args.logging_steps,
-
-        deepspeed=train_args.deepseed_config,
-        gradient_accumulation_steps=train_args.gradient_accumulation_steps,
-        fp16=train_args.float16,
-        bf16=train_args.bf16,
-
-        #load_best_model_at_end=True,
-        #metric_for_best_model="eval_loss",
-        save_only_model=True,
+        **build_training_arguments_kwargs(
+            train_args=train_args,
+            output_dir_name=output_dir_name,
+            reporter=reporter,
+            learning_rate=learning_rate,
+            train_batch_size=train_batch_size,
+        )
     )
 
 
     if train_args.train_on == 'function_param':
-        param_train_dataset = LLaMaDataset(tokenizer, json_file=data_path, max_length=source_length, split="train")
+        param_train_dataset = LLaMaDataset(tokenizer, json_file=data_path, max_length=source_length, split="train", task_weights=task_weights)
         param_test_dataset = LLaMaDataset(tokenizer, json_file=data_path, max_length=source_length, split="test")
-        function_train_dataset = LLaMaDataset(tokenizer, json_file=function_data_path, max_length=source_length, split="train")
+        function_train_dataset = LLaMaDataset(tokenizer, json_file=function_data_path, max_length=source_length, split="train", task_weights=task_weights)
         function_test_dataset = LLaMaDataset(tokenizer, json_file=function_data_path, max_length=source_length, split="test")
         train_dataset = ConcatDataset([param_train_dataset, function_train_dataset])
         test_dataset = ConcatDataset([param_test_dataset, function_test_dataset])
     elif train_args.train_on == 'param':
-        train_dataset = LLaMaDataset(tokenizer, json_file=data_path, max_length=source_length, split="train")
+        train_dataset = LLaMaDataset(tokenizer, json_file=data_path, max_length=source_length, split="train", task_weights=task_weights)
         test_dataset = LLaMaDataset(tokenizer, json_file=data_path, max_length=source_length, split="test")
     elif train_args.train_on == 'function':
-        train_dataset = LLaMaDataset(tokenizer, json_file=function_data_path, max_length=source_length, split="train")
+        train_dataset = LLaMaDataset(tokenizer, json_file=function_data_path, max_length=source_length, split="train", task_weights=task_weights)
         test_dataset = LLaMaDataset(tokenizer, json_file=function_data_path, max_length=source_length, split="test")
 
 
@@ -181,6 +205,7 @@ if __name__ == '__main__':
         logger.info('traing arguments: '+str(train_args))
         logger.info('training dataset size: '+str(len(train_dataset)))
         logger.info('test dataset size: '+str(len(test_dataset)))
+        logger.info('task weights: '+str(task_weights))
         logger.info('transfomers training_args: '+str(training_args))
 
 
@@ -192,8 +217,8 @@ if __name__ == '__main__':
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=test_dataset,
-        tokenizer=tokenizer,
         data_collator=data_collator,
+        **build_trainer_kwargs(tokenizer),
     )
 
     # trainer = Trainer(
@@ -206,4 +231,3 @@ if __name__ == '__main__':
     # )
 
     trainer.train()
-

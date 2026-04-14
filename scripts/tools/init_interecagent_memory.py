@@ -5,8 +5,13 @@ import random
 import numpy as np
 from time import time
 from tqdm import tqdm
-from openai import OpenAI
 from tenacity import retry, stop_after_attempt, wait_random_exponential
+
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if ROOT_DIR not in sys.path:
+    sys.path.append(ROOT_DIR)
+
+from PersonalWAB.openrouter_client import create_openai_client, normalize_model_name
 
 PRODUCT_PROMPT = '''
 Product:
@@ -32,9 +37,9 @@ History:
 
 @retry(wait=wait_random_exponential(multiplier=1, max=40), stop=stop_after_attempt(10))
 def generate_user_profile_GPT(user_history, model, system_prompt, temperature):
-    client = OpenAI()
+    client = create_openai_client()
     response = client.chat.completions.create(
-        model=model,
+        model=normalize_model_name(model),
         messages=[{"role": "system", "content": system_prompt}],
         max_tokens=5000,
         temperature=temperature,

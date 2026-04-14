@@ -5,6 +5,8 @@
 LLM-based Web agents overlook the importance of personalized data (e.g., user profiles and historical Web behaviors) in assisting the understanding of users' personalized instructions and executing customized actions. **PersonalWAB** (Personalized Web Agent Benchmark) serves as the first comprehensive benchmark designed to evaluate Web agents on tasks such as personalized search, recommendation, and review generation. The benchmark includes a set of personalized user data, Web functions, and evaluation paradigms that facilitate the development of more personalized Web agents.
 **PUMA** (Personalized User Memory-enhanced Alignment) is a framework developed to adapt LLMs to the personalized Web agent task. By leveraging a memory bank and task-specific retrieval strategies, PUMA filters relevant historical Web behaviors, enabling fine-tuned and optimized personalized action execution.
 
+This repository now also includes an additive **KG-PUMA** path that replaces flat memory conditioning with temporal graph retrieval, graph evidence serialization, and graph-aware DPO rewards while keeping the underlying LoRA-tuned causal LM training stack intact.
+
 
 > For more details, refer to our paper accepted to **WWW 2025**: [Large Language Models Empowered Personalized Web Agents](https://arxiv.org/abs/2410.17236).
 
@@ -16,6 +18,13 @@ LLM-based Web agents overlook the importance of personalized data (e.g., user pr
 - PyTorch 2.4.1
 - CUDA 12.5
 - openjdk
+
+Original paper experiments used the stack above. The current local development environment used for the KG-PUMA changes is:
+
+- conda env: `puma`
+- Python `3.14`
+- PyTorch `2.11`
+- CUDA `13.0`
 
 To install the required dependencies, run:
 ```bash
@@ -47,10 +56,12 @@ The dataset is available in "PersonalWAB/envs/pwab/data". Or you can download [h
 To run experiments on the **PersonalWAB** benchmark, use the following command:
 
 ```bash
-source scripts/set_api_key.sh  # Set your OpenAI API key
+source scripts/set_api_key.sh  # Set your OpenRouter API key
 bash scripts/run_singleturn.sh  # Single-turn track
 bash scripts/run_multiturn.sh   # Multi-turn track
 ```
+
+The default OpenAI SDK client in this repo is routed through OpenRouter's `https://openrouter.ai/api/v1` endpoint. Bare OpenAI model names such as `gpt-4o-mini` are normalized automatically when requests are sent.
 
 You can modify agent strategies, memory mechanisms, and parameters in the scripts to explore various configurations.
 
@@ -84,7 +95,30 @@ The **PUMA** framework adapts LLMs for personalized Web agent tasks by utilizing
 
 For more detailed information, refer to our paper.
 
+### KG-PUMA Graph Path
+
+The graph-conditioned redesign is implemented as an additive path on top of the original PUMA codebase. The main graph modules are:
+
+- `PUMA/graph/schema.py`
+- `PUMA/graph/builder.py`
+- `PUMA/graph/retriever.py`
+- `PUMA/graph/serializer.py`
+- `PUMA/graph/reward.py`
+- `PersonalWAB/agents/kg_puma_agent.py`
+
+The intended milestone-1 pipeline is:
+
+1. Build a temporal user graph from pre-task history only.
+2. Retrieve a task-conditioned subgraph instead of flat top-K memories.
+3. Serialize compact graph evidence into the SFT prompt.
+4. Generate graph-conditioned tool and parameter supervision.
+5. Build DPO pairs with composite graph-aware rewards.
+
+The graph path is retrieval- and supervision-centric. It does not add a GNN decoder or change the LoRA fine-tuning backbone in version 1.
+
 ### Training PUMA
+
+The original flat-memory PUMA workflow is still supported.
 
 **STEP 1: Prepare the SFT dataset.**
 
@@ -134,6 +168,93 @@ This step evaluates the final DPO model in the PersonalWAB benchmark. But you ca
 cd ..
 bash scripts/run_singleturn_puma.sh
 ```
+
+### Training KG-PUMA
+
+The graph-conditioned path uses the same SFT and DPO training entrypoints, but swaps in graph-conditioned data builders and a graph-aware runtime agent.
+
+Convenience wrappers matching the original PUMA layout are provided here:
+
+- `PUMA/scripts/pre_graph_sft_func_data.sh`
+- `PUMA/scripts/pre_graph_sft_param_data.sh`
+- `PUMA/scripts/pre_graph_dpo_data.sh`
+- `PUMA/scripts/finetune_graph_function_param.sh`
+- `PUMA/scripts/dpo_graph_llama.sh`
+- `PUMA/scripts/generate_graph_function.sh`
+- `PUMA/scripts/generate_graph_param_dpo.sh`
+- `scripts/fast_test_graph.sh`
+- `scripts/fast_test_graph_dpo.sh`
+- `scripts/run_singleturn_kg_puma.sh`
+
+These commands assume the same merged benchmark files used by the original PUMA pipeline, for example:
+
+- `data/user_instructions.json`
+- `data/user_history.json`
+- `data/user_profiles.json`
+- `data/all_products.json`
+
+**STEP 1: Prepare graph-conditioned SFT datasets.**
+
+```bash
+cd PUMA
+bash scripts/pre_graph_sft_func_data.sh
+bash scripts/pre_graph_sft_param_data.sh
+```
+
+**STEP 2: Run graph-conditioned SFT.**
+
+```bash
+bash scripts/finetune_graph_function_param.sh
+```
+
+`PUMA/scripts/finetune_graph_function_param.sh` defaults to graph datasets and recommendation up-weighting. Override paths or hyperparameters with environment variables before calling the script.
+
+**STEP 3: Optionally generate graph-conditioned predictions.**
+
+```bash
+bash scripts/generate_graph_function.sh
+bash scripts/generate_graph_param_dpo.sh
+```
+
+These wrappers write graph-mode outputs to `output/res/graph_function_res.json` and `output/res/graph_param_res.json` by default.
+
+**STEP 4: Build graph-aware DPO pairs.**
+
+`prepare_graph_dpo_data.py` constructs chosen/rejected pairs from composite rewards with task, faithfulness, validity, multi-hop, and length components.
+
+```bash
+bash scripts/pre_graph_dpo_data.sh
+```
+
+**STEP 5: Run graph-aware DPO.**
+
+```bash
+bash scripts/dpo_graph_llama.sh
+```
+
+**STEP 6: Evaluate graph-conditioned predictions offline.**
+
+```bash
+cd ..
+bash scripts/fast_test_graph.sh
+bash scripts/fast_test_graph_dpo.sh
+```
+
+**STEP 7: Evaluate with graph retrieval at runtime.**
+
+Use `kg_puma` to assemble graph evidence online during inference.
+
+```bash
+cd ..
+bash scripts/run_singleturn_kg_puma.sh
+```
+
+### Graph-Specific Notes
+
+- Non-review graph retrieval is built from pre-task history only; target product metadata is only injected for review tasks.
+- `test.py --graph_mode` logs decomposed graph rewards: task score, faithfulness, validity, hop bonus, length penalty, and final composite reward.
+- `run.py --agent_strategy kg_puma` is the online graph-conditioned inference path.
+- The flat-memory `puma` path remains unchanged for baseline comparison.
 
 ## 📚 Citation
 

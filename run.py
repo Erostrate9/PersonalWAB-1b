@@ -12,7 +12,7 @@ from typing import Any, Dict, List
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
-from transformers import LlamaTokenizer, LlamaForCausalLM
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel
 import torch
 import time
@@ -122,9 +122,7 @@ def agent_factory(tools_info, sys_prompt, args: argparse.Namespace) -> BaseAgent
             )
 
             if "gpt" in args.model:
-                initialize_client(
-                    api_key=os.getenv("OPENAI_API_KEY")
-                )
+                initialize_client()
 
             return GPTFunctionCallingAgent(tools_info, sys_prompt, model=args.model, 
                                            function_selection_file=args.puma_function_file, memory_file=args.interec_memory_file)
@@ -154,9 +152,7 @@ def agent_factory(tools_info, sys_prompt, args: argparse.Namespace) -> BaseAgent
             )
 
             if "gpt" in args.model:
-                initialize_client(
-                    api_key=os.getenv("OPENAI_API_KEY")
-                )
+                initialize_client()
             elif (
                 "mistralai/Mi" in args.model or "meta-llama/Meta-Llama-3-" in args.model
             ):
@@ -175,8 +171,17 @@ def agent_factory(tools_info, sys_prompt, args: argparse.Namespace) -> BaseAgent
             '''To save time, simply use pre-generated results to evaluate'''
             return PUMAAgent(function_file, param_file, None, sys_prompt, None)
         #If you want to generate results, you need to change the path to the model
-        llama_model, llama_tokenizer = load_llama_model(args.puma_model_path, 'meta-llama/Llama-2-7b-chat-hf', torch.float16)
+        llama_model, llama_tokenizer = load_llama_model(args.puma_model_path, args.puma_base_model, torch.float16)
         return PUMAAgent(function_file, None, llama_model, sys_prompt, llama_tokenizer, max_length=1024, memory_token_length=args.mem_token_length)
+    elif args.agent_strategy == "kg_puma":
+        from PersonalWAB.agents.kg_puma_agent import KGPUMAAgent
+
+        function_file = args.puma_function_file
+        param_file = args.puma_param_file
+        if args.puma_generate == 0:
+            return KGPUMAAgent(function_file, param_file, None, sys_prompt, None)
+        llama_model, llama_tokenizer = load_llama_model(args.puma_model_path, args.puma_base_model, torch.float16)
+        return KGPUMAAgent(function_file, None, llama_model, sys_prompt, llama_tokenizer, max_length=1024, memory_token_length=args.mem_token_length)
     else:
         raise ValueError(f"Unknown agent strategy: {args.agent_strategy}")
 
@@ -186,8 +191,10 @@ global_tokenizer = None
 def load_llama_model(model_path, base_model, torch_dtype):
     global global_model, global_tokenizer
     if global_model is None and global_tokenizer is None:
-        global_tokenizer = LlamaTokenizer.from_pretrained(model_path)
-        global_model = LlamaForCausalLM.from_pretrained(
+        global_tokenizer = AutoTokenizer.from_pretrained(model_path)
+        if global_tokenizer.pad_token is None:
+            global_tokenizer.pad_token = global_tokenizer.eos_token
+        global_model = AutoModelForCausalLM.from_pretrained(
                 base_model,
                 torch_dtype=torch_dtype,
                 #device_map=device_map,
@@ -341,7 +348,7 @@ def main():
         "--agent_strategy",
         type=str,
         default="function_calling",
-        choices=["function_calling", "react", "react_reflect", 'recmind', 'puma'],
+        choices=["function_calling", "react", "react_reflect", 'recmind', 'puma', 'kg_puma'],
     )
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument(
@@ -375,7 +382,8 @@ def main():
     parser.add_argument("--puma_param_file", type=str, default=None)
     parser.add_argument("--puma_function_file", type=str, default=None)
     parser.add_argument("--puma_generate", type=int, default=0)
-    parser.add_argument("--puma_model_path", type=str, default='finetune/output/input/Llama-2-7b-chat-hf/')
+    parser.add_argument("--puma_model_path", type=str, default='finetune/output/input/Llama-3.2-1B-Instruct/')
+    parser.add_argument("--puma_base_model", type=str, default='meta-llama/Llama-3.2-1B-Instruct')
     parser.add_argument("--mem_token_length", type=int, default=768)
 
     args = parser.parse_args()

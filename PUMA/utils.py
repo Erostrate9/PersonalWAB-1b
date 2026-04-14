@@ -14,23 +14,32 @@ import numpy as np
 from tqdm import tqdm
 import random
 import wandb
-from typing import Dict, List
+from typing import Any, Dict, List
 import torch.nn.functional as F
 import sys
 import json
 import re
 from datasets import load_dataset
 
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if ROOT_DIR not in sys.path:
+    sys.path.append(ROOT_DIR)
+
+from PersonalWAB.openrouter_client import create_openai_client, normalize_model_name
+
 
 class LLaMaDataset(Dataset):
-    def __init__(self, tokenizer, json_file, max_length, split="train", subset_size=None):
+    def __init__(self, tokenizer, json_file, max_length, split="train", subset_size=None, task_weights=None):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.subset_size = subset_size
+        self.task_weights = task_weights or {}
         
         with open(json_file, 'r', encoding="utf-8") as f:
             data = json.load(f)
         self.dataset = data.get(split, [])
+        if self.task_weights:
+            self.dataset = self._apply_task_weights(self.dataset)
         if self.subset_size is not None:
             indices = list(range(len(self.dataset)))
             sampled_indices = random.sample(indices, self.subset_size)
@@ -44,6 +53,15 @@ class LLaMaDataset(Dataset):
         input_text = item['prompt']
         target_text = item['target']
         return preprocess_function(input_text, target_text, self.tokenizer, self.max_length)
+
+    def _apply_task_weights(self, dataset):
+        weighted_dataset = []
+        for item in dataset:
+            task_type = infer_task_type(item)
+            weight = max(1, int(round(self.task_weights.get(task_type, 1))))
+            for _ in range(weight):
+                weighted_dataset.append(item)
+        return weighted_dataset
 
 
 def preprocess_function(prefix_text, target_text, tokenizer, max_length):
@@ -94,6 +112,19 @@ def load_function_prompt(data_file, split):
     return tasks, source, target
 
 
+def infer_task_type(item):
+    if item.get('task_type'):
+        return item['task_type']
+    tool = item.get('tool') or item.get('target')
+    if tool == 'search_product_by_query':
+        return 'search'
+    if tool == 'get_recommendations_by_history':
+        return 'recommend'
+    if tool == 'add_product_review':
+        return 'review'
+    return 'unknown'
+
+
 def load_param_prompt(data_file, tool_file, split, mem_token_length, tokenizer):
     data = json.load(open(data_file, encoding="utf-8"))
     tool_file = json.load(open(tool_file))
@@ -103,13 +134,17 @@ def load_param_prompt(data_file, tool_file, split, mem_token_length, tokenizer):
     for i in range(len(data[split])):
         item = data[split][i]
         task = item['instruction']
-        input_text = PARAM_PROMPT.replace('<Instruction>', task)
-        mem = item['mem']
-        tokenized_memory = tokenizer(mem, return_tensors=None, truncation=True, max_length=mem_token_length)
-        memory_text = tokenizer.decode(tokenized_memory["input_ids"], skip_special_tokens=True)
-        input_text = input_text.replace('<Memory>', memory_text)
-        input_text = input_text.replace('<Tool>', tool_file[task][0])
-        tool_input = item['target']
+        tool_input = item.get('target', '')
+
+        if item.get('graph_mode') or 'mem' not in item:
+            input_text = item['prompt']
+        else:
+            input_text = PARAM_PROMPT.replace('<Instruction>', task)
+            mem = item['mem']
+            tokenized_memory = tokenizer(mem, return_tensors=None, truncation=True, max_length=mem_token_length)
+            memory_text = tokenizer.decode(tokenized_memory["input_ids"], skip_special_tokens=True)
+            input_text = input_text.replace('<Memory>', memory_text)
+            input_text = input_text.replace('<Tool>', tool_file[task][0])
         
         tasks.append(task)
         source.append(input_text)
@@ -124,7 +159,7 @@ class LlaMaTrainerwithTemperature(Trainer):
         self.temperature = temperature
         self.vocab_size = vocab_size
 
-    def compute_loss(self, model, inputs, return_outputs=False):
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None, **kwargs):
         labels = inputs.get("labels")
         outputs = model(**inputs)
         logits = outputs.logits
@@ -147,8 +182,6 @@ class LlaMaTrainerwithTemperature(Trainer):
 
         return (loss, outputs) if return_outputs else loss
 
-
-from openai import OpenAI
 
 HISTORY_PROMPT = '''
 MEMORY <NUM>:
@@ -206,6 +239,34 @@ FUNCTION_PROMPT = '''Below is an instruction that describes a task. Choose a too
 ### Instruction: <Instruction>
 
 ### Tool:
+'''
+
+GRAPH_FUNCTION_PROMPT = '''Below is an instruction that describes a task. Choose a tool that appropriately completes the request.
+### Instruction: <Instruction>
+
+Retrieved Graph Sketch:
+<GraphEvidence>
+
+Choose exactly one tool from:
+- search_product_by_query
+- get_recommendations_by_history
+- add_product_review
+
+### Tool:
+'''
+
+GRAPH_PARAM_PROMPT = '''Below is an instruction that describes a task. Generate the tool parameter that appropriately completes the request.
+### Instruction: <Instruction>
+
+Retrieved Graph Evidence:
+<GraphEvidence>
+
+Tool: <Tool>
+
+Output Contract:
+Return only the tool parameter. Do not include explanation, JSON wrappers, or tool names.
+
+### Tool Parameter:
 '''
 
 def mean_pooling(model_output, attention_mask):
@@ -299,14 +360,83 @@ Tool: search_product_by_query
     prompt = prompt.replace('<Memory>', '|'.join(mem))   
     messages = [{'role': 'system', 'content': prompt}]    
     #print(prompt)
-    client = OpenAI()
+    client = create_openai_client()
     response = client.chat.completions.create(
-        model='gpt-4o-mini',
+        model=normalize_model_name('gpt-4o-mini'),
         messages=messages,
         temperature=0,
     )
     message = response.choices[0].message.content
     #print(message)
     return message
+
+
+def truncate_text(tokenizer, text: str, max_length: int) -> str:
+    tokenized = tokenizer(text, return_tensors=None, truncation=True, max_length=max_length)
+    return tokenizer.decode(tokenized["input_ids"], skip_special_tokens=True)
+
+
+def build_graph_function_prompt(instruction: str, graph_text: str) -> str:
+    return GRAPH_FUNCTION_PROMPT.replace('<Instruction>', instruction).replace('<GraphEvidence>', graph_text or 'No graph evidence available.')
+
+
+def build_graph_param_prompt(
+    instruction: str,
+    tool_name: str,
+    graph_text: str,
+    product_info: Dict[str, Any] | None = None,
+) -> str:
+    product_text = prettify_product_info(product_info) if product_info else ''
+    full_instruction = instruction + product_text
+    return (
+        GRAPH_PARAM_PROMPT
+        .replace('<Instruction>', full_instruction)
+        .replace('<GraphEvidence>', graph_text or 'No graph evidence available.')
+        .replace('<Tool>', tool_name)
+    )
+
+
+def serialize_graph_subgraph(subgraph) -> str:
+    from PUMA.graph.serializer import serialize_subgraph
+
+    return serialize_subgraph(subgraph)
+
+
+def generate_graph_search_query(instruction: str, subgraph) -> str:
+    from PUMA.graph.reward import synthesize_search_query
+
+    return synthesize_search_query(instruction, subgraph)
+
+
+def build_graph_negative_candidates(task: Dict[str, Any], subgraph) -> List[str]:
+    from PUMA.graph.reward import build_graph_candidates
+
+    return build_graph_candidates(task, subgraph)
+
+
+VALID_TOOL_NAMES = (
+    "search_product_by_query",
+    "get_recommendations_by_history",
+    "add_product_review",
+)
+
+
+def normalize_tool_prediction(text: str) -> str:
+    if text is None:
+        return ""
+    cleaned = str(text).strip()
+    cleaned = cleaned.replace("<s>", "").replace("</s>", "").strip()
+
+    for tool_name in VALID_TOOL_NAMES:
+        if tool_name in cleaned:
+            return tool_name
+
+    if cleaned.startswith("search_product"):
+        return "search_product_by_query"
+    if "recommend" in cleaned:
+        return "get_recommendations_by_history"
+    if "review" in cleaned:
+        return "add_product_review"
+    return cleaned
 
     
